@@ -35,6 +35,7 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
     var videoOutputURL : URL?
     var videoWriter : AVAssetWriter?
     var audioInput:AVAssetWriterInput!
+    var micInput:AVAssetWriterInput!
     var videoWriterInput : AVAssetWriterInput?
     
     var success: Bool = false
@@ -44,20 +45,39 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
     var eventName: String = ""
     var message: String = ""
     
-    
     var myResult: FlutterResult?
     
     var recorderConfig:RecorderConfig = RecorderConfig()
-    
+  
+    let audioSession = AVAudioSession.sharedInstance()
+  
+    var lastAppAudioTimestamp: CMTime?
+    var lastMicAudioTimestamp: CMTime?
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "ed_screen_recorder", binaryMessenger: registrar.messenger())
         let instance = SwiftEdScreenRecorderPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
+
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+          try audioSession.setCategory(.playAndRecord, options: [.defaultToSpeaker])
+            try audioSession.setActive(true)
+        } catch {
+            print("Failed to configure audio session: \(error.localizedDescription)")
+        }
     }
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         
         if(call.method == "startRecordScreen"){
+            do {
+                try audioSession.setCategory(.playAndRecord, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+                try audioSession.setActive(true)
+            } catch {
+                print("Failed to configure audio session: \(error.localizedDescription)")
+            }
+
             let args = call.arguments as? Dictionary<String, Any>
             recorderConfig = RecorderConfig()
             recorderConfig.isAudioEnabled=((args?["audioenable"] as? Bool?)! ?? false)!
@@ -113,6 +133,14 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
             }else{
                 self.success=Bool(false)
             }
+
+            do {
+              try audioSession.setCategory(.playAndRecord, options: [.defaultToSpeaker])
+              try audioSession.setActive(true)
+            } catch {
+                print("Failed to configure audio session: \(error.localizedDescription)")
+            }
+
             myResult = result
             let jsonObject: JsonObj = JsonObj(
                 success: Bool(self.success),
@@ -169,20 +197,19 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
                 res = Bool(false);
             }
             if #available(iOS 11.0, *) {
-                recorder.isMicrophoneEnabled = recorderConfig.isAudioEnabled
+                recorder.isMicrophoneEnabled = self.recorderConfig.isAudioEnabled
                 let videoSettings: [String : Any] = [
                     AVVideoCodecKey  : AVVideoCodecType.h264,
                     AVVideoWidthKey  : NSNumber.init(value: width),
                     AVVideoHeightKey : NSNumber.init(value: height),
                     AVVideoCompressionPropertiesKey: [
                         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                        AVVideoAverageBitRateKey: recorderConfig.videoBitrate!
+                        //AVVideoAverageBitRateKey: recorderConfig.videoBitrate!
                     ] as [String : Any],
                 ]
-                self.videoWriterInput = AVAssetWriterInput(mediaType: AVMediaType.video, outputSettings: videoSettings);
+              self.videoWriterInput = AVAssetWriterInput(mediaType: AVMediaType.video, outputSettings: videoSettings);
                 self.videoWriterInput?.expectsMediaDataInRealTime = true;
                 self.videoWriter?.add(videoWriterInput!);
-                if(recorderConfig.isAudioEnabled) {
                     let audioOutputSettings: [String : Any] = [
                         AVNumberOfChannelsKey : 2,
                         AVFormatIDKey : kAudioFormatMPEG4AAC,
@@ -192,9 +219,15 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
                     self.audioInput = AVAssetWriterInput(mediaType: AVMediaType.audio, outputSettings: audioOutputSettings)
                     self.audioInput?.expectsMediaDataInRealTime = true;
                     self.videoWriter?.add(audioInput!);
+                  
+                if(recorderConfig.isAudioEnabled) {
+                    self.micInput = AVAssetWriterInput(mediaType: AVMediaType.audio, outputSettings: audioOutputSettings)
+                    self.micInput?.expectsMediaDataInRealTime = true;
+                    self.videoWriter?.add(micInput!);
                 }
                 
                 recorder.startCapture(handler: { (cmSampleBuffer, rpSampleType, error) in guard error == nil else { return }
+                  
                     switch rpSampleType {
                     case RPSampleBufferType.video:
                         if self.videoWriter?.status == AVAssetWriter.Status.unknown {
@@ -208,15 +241,12 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
                                 }
                             }
                         }
+                    case RPSampleBufferType.audioApp:
+                      self.handleAppAudioSampleBuffer(cmSampleBuffer)
+                      
                     case RPSampleBufferType.audioMic:
-                        if(self.recorderConfig.isAudioEnabled){
-                            if self.audioInput?.isReadyForMoreMediaData == true {
-                                if self.audioInput?.append(cmSampleBuffer) == false {
-                                    print(self.videoWriter?.status ?? "")
-                                    print(self.videoWriter?.error ?? "")
-                                }
-                            }
-                        }
+                      self.handleMicAudioSampleBuffer(cmSampleBuffer)
+                      
                     default:
                         break;
                     }
@@ -228,6 +258,50 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
         }
         return  Bool(res)
     }
+  
+  func handleAppAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    if self.audioInput?.isReadyForMoreMediaData == true {
+      // Synchronize with the mic audio track
+      let appTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+      
+       // Synchronize with the mic audio track
+      if let micTimestamp = self.lastMicAudioTimestamp {
+           if appTimestamp > micTimestamp {
+               let delay = CMTimeSubtract(appTimestamp, micTimestamp)
+               print("App audio is ahead, delaying by: \(delay.seconds) seconds")
+               Thread.sleep(forTimeInterval: delay.seconds)
+           }
+       }
+      
+        if self.audioInput?.append(sampleBuffer) == false {
+            print(self.videoWriter?.status ?? "")
+            print(self.videoWriter?.error ?? "")
+        }
+    }
+  }
+  
+  func handleMicAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    if(self.recorderConfig.isAudioEnabled){
+      let micTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+         
+         // Synchronize with the app audio track
+          if let appTimestamp = self.lastAppAudioTimestamp {
+             if micTimestamp > appTimestamp {
+                 let delay = CMTimeSubtract(micTimestamp, appTimestamp)
+                 print("Mic audio is ahead, delaying by: \(delay.seconds) seconds")
+                 Thread.sleep(forTimeInterval: delay.seconds)
+             }
+         }
+      
+        if self.micInput?.isReadyForMoreMediaData == true {
+            if self.micInput?.append(sampleBuffer) == false {
+                print(self.videoWriter?.status ?? "")
+                print(self.videoWriter?.error ?? "")
+            }
+        }
+    }
+  }
+
     
     @objc func stopRecording() -> Bool {
         var res: Bool = true
@@ -241,8 +315,9 @@ public class SwiftEdScreenRecorderPlugin: NSObject, FlutterPlugin {
                         DispatchQueue.main.async {
                             if self.videoWriter?.status == .writing {
                                 self.videoWriterInput?.markAsFinished()
+                                self.audioInput?.markAsFinished()
                                 if self.recorderConfig.isAudioEnabled {
-                                    self.audioInput?.markAsFinished()
+                                    self.micInput?.markAsFinished()
                                 }
 
                                 self.videoWriter?.finishWriting {
